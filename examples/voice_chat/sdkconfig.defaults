@@ -256,6 +256,14 @@ CONFIG_AUDIO_ENCODER_LC3_SUPPORT=n
 CONFIG_ESP_AUDIO_SIMPLE_PLAYER_HTTP_EN=n
 CONFIG_ESP_AUDIO_SIMPLE_PLAYER_FILE_EN=n
 # end of Audio Simple Player IO Stream
+#
+# Match DAC (16 kHz / 2 ch / 32-bit). Brookesia speaker uses the same ASP dest.
+# Default ASP dest is 48 kHz / 1 ch / 16-bit, which plays prompts too fast.
+#
+CONFIG_AUDIO_SIMPLE_PLAYER_RESAMPLE_DEST_RATE=16000
+CONFIG_ESP_AUDIO_SIMPLE_PLAYER_CH_CVT_EN=y
+CONFIG_ESP_AUDIO_SIMPLE_PLAYER_BIT_CVT_EN=y
+CONFIG_AUDIO_SIMPLE_PLAYER_BIT_CVT_DEST_32BIT=y
 # end of ESP Audio Simple Player
 
 #
