@@ -28,6 +28,10 @@ typedef enum {
      * Agent should only be started on AGENT_SETUP_EVENT_START event.
      */
     AGENT_SETUP_EVENT_AGENT_ID_UPDATE,
+    /**
+     * Refresh token was written. voice_chat applies it in-place; do not reboot.
+     */
+    AGENT_SETUP_EVENT_REFRESH_TOKEN_UPDATE,
 } agent_setup_event_t;
 
 /** @brief Initiaze the Agent Setup

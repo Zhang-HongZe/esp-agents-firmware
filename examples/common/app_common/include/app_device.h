@@ -28,12 +28,30 @@ typedef enum {
     DEVICE_EVENT_REMINDER_COMPLETE,
     DEVICE_EVENT_SET_USER_TEXT,
     DEVICE_EVENT_SET_ASSISTANT_TEXT,
+    DEVICE_EVENT_ERROR,
     DEVICE_EVENT_MAX,
 } app_device_event_t;
 
-// Event data union for different event types
-typedef union {
-    const char *text;           // For REMINDER, SET_USER_TEXT, SET_ASSISTANT_TEXT events
+typedef enum {
+    APP_DEVICE_ERROR_NONE = 0,
+    APP_DEVICE_ERROR_WAITING_TOKEN, /* Wi-Fi up, waiting for RainMaker Home token */
+    APP_DEVICE_ERROR_NOT_CONFIGURED,
+    APP_DEVICE_ERROR_WIFI,
+    APP_DEVICE_ERROR_WIFI_NEED_CONNECT, /* No Wi-Fi after boot/disconnect delay */
+    APP_DEVICE_ERROR_WIFI_CONNECTED,
+    APP_DEVICE_ERROR_SERVER_CONNECTING,
+    APP_DEVICE_ERROR_SERVER_CONNECTED,
+    APP_DEVICE_ERROR_QUOTA,
+    APP_DEVICE_ERROR_CONVERSATION,
+    APP_DEVICE_ERROR_SERVICE,
+    APP_DEVICE_ERROR_LOW_POWER,
+    APP_DEVICE_ERROR_SCAN_QRCODE, /* Unbound device QR screen */
+} app_device_error_kind_t;
+
+// Event data for reminder / text / error events
+typedef struct {
+    const char *text;
+    app_device_error_kind_t error_kind;
 } device_event_data_t;
 
 typedef enum {

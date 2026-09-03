@@ -10,6 +10,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_touch.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 #include <agent_setup.h>
 #include <network_provisioning/manager.h>
@@ -45,6 +46,49 @@ struct emote_s {
 };
 
 static app_display_data_t s_display_data = {0};
+static esp_timer_handle_t s_scan_qrcode_timer;
+
+#define APP_DISPLAY_SCAN_QRCODE_INTERVAL_US  (10 * 1000 * 1000ULL)
+
+static void display_play_scan_qrcode(void)
+{
+    device_event_data_t event_data = {
+        .text = "Scan QR code",
+        .error_kind = APP_DEVICE_ERROR_SCAN_QRCODE,
+    };
+    app_device_event_enqueue(DEVICE_EVENT_ERROR, &event_data);
+}
+
+static void display_scan_qrcode_timer_cb(void *arg)
+{
+    (void)arg;
+    display_play_scan_qrcode();
+}
+
+static void display_start_scan_qrcode_prompt(void)
+{
+    display_play_scan_qrcode();
+    if (!s_scan_qrcode_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = display_scan_qrcode_timer_cb,
+            .name = "scan_qr",
+        };
+        if (esp_timer_create(&args, &s_scan_qrcode_timer) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create scan QR timer");
+            return;
+        }
+    }
+    if (!esp_timer_is_active(s_scan_qrcode_timer)) {
+        esp_timer_start_periodic(s_scan_qrcode_timer, APP_DISPLAY_SCAN_QRCODE_INTERVAL_US);
+    }
+}
+
+static void display_stop_scan_qrcode_prompt(void)
+{
+    if (s_scan_qrcode_timer && esp_timer_is_active(s_scan_qrcode_timer)) {
+        esp_timer_stop(s_scan_qrcode_timer);
+    }
+}
 
 static const char *valid_emotions[] = {
     DISP_EMOTE_NEUTRAL,
@@ -240,14 +284,16 @@ static void display_event_handler(void *arg, esp_event_base_t event_base, int32_
         char *text = (char *)event_data;
         ESP_LOGI(TAG, "Provisioning QR Data: %s", text);
 
-        app_display_set_text(APP_DEVICE_TEXT_TYPE_SYSTEM, "Scan QR code with RainMaker", NULL);
+        app_display_set_text(APP_DEVICE_TEXT_TYPE_SYSTEM, "Scan RainMaker Home", NULL);
         change_emotion_visibility(s_display_data.emote_handle, false);
         emote_set_qrcode_data(s_display_data.emote_handle, text);
+        display_start_scan_qrcode_prompt();
 
         esp_event_handler_unregister(APP_NETWORK_EVENT, APP_NETWORK_EVENT_QR_DISPLAY, display_event_handler);
     } else if (event_base == WIFI_EVENT &&
         (event_id == WIFI_EVENT_STA_CONNECTED || event_id == WIFI_EVENT_STA_DISCONNECTED)) {
 
+        display_stop_scan_qrcode_prompt();
         change_qrcode_visibility(s_display_data.emote_handle, false);
         app_display_set_emotion(DISP_EMOTE_IDLE);
     }

@@ -1,5 +1,6 @@
 #include <esp_check.h>
 #include <esp_log.h>
+#include <esp_sleep.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <esp_timer.h>
@@ -10,6 +11,7 @@
 
 #include "app_agent.h"
 #include "app_audio.h"
+#include "app_battery.h"
 #include "app_device.h"
 #include "app_capacitive_touch.h"
 #include "app_touch_press.h"
@@ -57,6 +59,8 @@ typedef struct {
     bool wakeup_start_pending;
     esp_timer_handle_t sleep_timer;
     bool reminder_active;
+    bool error_active;
+    app_device_error_kind_t pending_error_audio;
     esp_timer_handle_t reminder_complete_timer;
     bool system_initialized;
     esp_err_t (*set_text_cb)(app_device_text_type_t text_type, const char *text, void *priv_data);
@@ -74,6 +78,87 @@ extern const uint8_t wakeup_end_mp3_end[] asm("_binary_wakeup_end_mp3_end");
 
 extern const uint8_t finish_reminder_mp3_start[] asm("_binary_finish_reminder_mp3_start");
 extern const uint8_t finish_reminder_mp3_end[] asm("_binary_finish_reminder_mp3_end");
+
+extern const uint8_t quota_exceeded_mp3_start[] asm("_binary_quota_exceeded_mp3_start");
+extern const uint8_t quota_exceeded_mp3_end[] asm("_binary_quota_exceeded_mp3_end");
+
+extern const uint8_t server_disconnect_mp3_start[] asm("_binary_server_disconnect_mp3_start");
+extern const uint8_t server_disconnect_mp3_end[] asm("_binary_server_disconnect_mp3_end");
+
+extern const uint8_t agent_not_configured_mp3_start[] asm("_binary_agent_not_configured_mp3_start");
+extern const uint8_t agent_not_configured_mp3_end[] asm("_binary_agent_not_configured_mp3_end");
+
+extern const uint8_t wifi_connect_success_mp3_start[] asm("_binary_wifi_connect_success_mp3_start");
+extern const uint8_t wifi_connect_success_mp3_end[] asm("_binary_wifi_connect_success_mp3_end");
+
+extern const uint8_t wifi_connect_error_mp3_start[] asm("_binary_wifi_connect_error_mp3_start");
+extern const uint8_t wifi_connect_error_mp3_end[] asm("_binary_wifi_connect_error_mp3_end");
+
+extern const uint8_t wifi_disconnect_mp3_start[] asm("_binary_wifi_disconnect_mp3_start");
+extern const uint8_t wifi_disconnect_mp3_end[] asm("_binary_wifi_disconnect_mp3_end");
+
+extern const uint8_t server_connecting_mp3_start[] asm("_binary_server_connecting_mp3_start");
+extern const uint8_t server_connecting_mp3_end[] asm("_binary_server_connecting_mp3_end");
+
+extern const uint8_t server_connected_mp3_start[] asm("_binary_server_connected_mp3_start");
+extern const uint8_t server_connected_mp3_end[] asm("_binary_server_connected_mp3_end");
+
+extern const uint8_t scan_qrcode_mp3_start[] asm("_binary_scan_qrcode_mp3_start");
+extern const uint8_t scan_qrcode_mp3_end[] asm("_binary_scan_qrcode_mp3_end");
+
+static void device_play_error_audio(app_device_error_kind_t kind)
+{
+    switch (kind) {
+        case APP_DEVICE_ERROR_NOT_CONFIGURED:
+            app_audio_play_media_async("embed://audio/0_agent_not_configured.mp3",
+                                       agent_not_configured_mp3_start,
+                                       agent_not_configured_mp3_end - agent_not_configured_mp3_start);
+            break;
+        case APP_DEVICE_ERROR_WIFI:
+            app_audio_play_media_async("embed://audio/0_wifi_disconnect.mp3",
+                                       wifi_disconnect_mp3_start,
+                                       wifi_disconnect_mp3_end - wifi_disconnect_mp3_start);
+            break;
+        case APP_DEVICE_ERROR_WIFI_NEED_CONNECT:
+            app_audio_play_media_async("embed://audio/0_wifi_connect_error.mp3",
+                                       wifi_connect_error_mp3_start,
+                                       wifi_connect_error_mp3_end - wifi_connect_error_mp3_start);
+            break;
+        case APP_DEVICE_ERROR_WIFI_CONNECTED:
+            app_audio_play_media_async("embed://audio/0_wifi_connect_success.mp3",
+                                       wifi_connect_success_mp3_start,
+                                       wifi_connect_success_mp3_end - wifi_connect_success_mp3_start);
+            break;
+        case APP_DEVICE_ERROR_SERVER_CONNECTING:
+            app_audio_play_media_async("embed://audio/0_server_connecting.mp3",
+                                       server_connecting_mp3_start,
+                                       server_connecting_mp3_end - server_connecting_mp3_start);
+            break;
+        case APP_DEVICE_ERROR_SERVER_CONNECTED:
+            app_audio_play_media_async("embed://audio/0_server_connected.mp3",
+                                       server_connected_mp3_start,
+                                       server_connected_mp3_end - server_connected_mp3_start);
+            break;
+        case APP_DEVICE_ERROR_QUOTA:
+            app_audio_play_media_async("embed://audio/0_quota_exceeded.mp3",
+                                       quota_exceeded_mp3_start,
+                                       quota_exceeded_mp3_end - quota_exceeded_mp3_start);
+            break;
+        case APP_DEVICE_ERROR_CONVERSATION:
+        case APP_DEVICE_ERROR_SERVICE:
+            app_audio_play_media_async("embed://audio/0_server_disconnect.mp3",
+                                       server_disconnect_mp3_start,
+                                       server_disconnect_mp3_end - server_disconnect_mp3_start);
+            break;
+        case APP_DEVICE_ERROR_SCAN_QRCODE:
+            app_audio_play_media_async("embed://audio/0_scan_qrcode.mp3",
+                                       scan_qrcode_mp3_start,
+                                       scan_qrcode_mp3_end - scan_qrcode_mp3_start);
+            break;
+        default:
+            break;
+    }
+}
 
 static void device_sleep_timer_callback(void *arg)
 {
@@ -107,8 +192,8 @@ static void device_notify_state_changed(app_device_system_state_t state)
 
 static const char *deivce_get_agent_state_text(void)
 {
-    /* Don't update if reminder is active */
-    if (g_device_data.reminder_active) {
+    /* Don't update if reminder or error prompt is active */
+    if (g_device_data.reminder_active || g_device_data.error_active) {
         return NULL;
     }
 
@@ -200,6 +285,7 @@ void device_process_event(app_device_event_t event, void *data)
     switch (event) {
         case DEVICE_EVENT_SYSTEM_INITIALIZED:
             g_device_data.system_initialized = true;
+            g_device_data.error_active = false;
             break;
 
         case DEVICE_EVENT_SPEECH_START:
@@ -258,16 +344,23 @@ void device_process_event(app_device_event_t event, void *data)
             break;
 
         case DEVICE_EVENT_SLEEP:
-            device_set_text(APP_DEVICE_TEXT_TYPE_SYSTEM, "Zzzz...");
+            if (!g_device_data.error_active) {
+                device_set_text(APP_DEVICE_TEXT_TYPE_SYSTEM, "Zzzz...");
+            }
             device_perform_action(DEVICE_ACTION_MICROPHONE_STOP);
             device_perform_action(DEVICE_ACTION_SLEEP_TIMER_STOP);
 
-            /* Don't play wakeup_end chime if device is already in idle state */
-            if (g_device_data.state != DEVICE_STATE_IDLE) {
+            app_agent_speech_conversation_end();
+
+            /* Play deferred error prompt after the agent conversation is torn down.
+             * Starting GMF media in the same tick as esp_agent_stop corrupted the heap.
+             */
+            if (g_device_data.pending_error_audio != APP_DEVICE_ERROR_NONE) {
+                device_play_error_audio(g_device_data.pending_error_audio);
+                g_device_data.pending_error_audio = APP_DEVICE_ERROR_NONE;
+            } else if (g_device_data.state != DEVICE_STATE_IDLE && !g_device_data.error_active) {
                 app_audio_play_media_async("embed://audio/0_wakeup_end.mp3", wakeup_end_mp3_start, wakeup_end_mp3_end - wakeup_end_mp3_start);
             }
-
-            app_agent_speech_conversation_end();
 
             device_notify_state_changed(APP_DEVICE_SYSTEM_STATE_SLEEP);
             g_device_data.state = DEVICE_STATE_IDLE;
@@ -290,6 +383,9 @@ void device_process_event(app_device_event_t event, void *data)
             break;
 
         case DEVICE_EVENT_AGENT_STATE_CHANGED:
+            if (app_agent_get_state() == APP_AGENT_STATE_STARTED) {
+                g_device_data.error_active = false;
+            }
             // Update display text based on agent state
             if (!g_device_data.reminder_active) {
                 device_set_text(APP_DEVICE_TEXT_TYPE_SYSTEM, deivce_get_agent_state_text());
@@ -347,6 +443,49 @@ void device_process_event(app_device_event_t event, void *data)
             if (has_data && event_data.text && g_device_data.state != DEVICE_STATE_IDLE) {
                 device_set_text(APP_DEVICE_TEXT_TYPE_ASSISTANT, event_data.text);
                 free((char *)event_data.text);
+            }
+            break;
+
+        case DEVICE_EVENT_ERROR:
+            if (!has_data || !event_data.text) {
+                ESP_LOGE(TAG, "Error event without text");
+                break;
+            }
+            if (event_data.error_kind == APP_DEVICE_ERROR_WAITING_TOKEN ||
+                event_data.error_kind == APP_DEVICE_ERROR_WIFI_CONNECTED) {
+                g_device_data.error_active = false;
+                device_set_text(APP_DEVICE_TEXT_TYPE_SYSTEM, event_data.text);
+                if (event_data.error_kind == APP_DEVICE_ERROR_WIFI_CONNECTED) {
+                    device_play_error_audio(APP_DEVICE_ERROR_WIFI_CONNECTED);
+                }
+                break;
+            }
+            if (event_data.error_kind == APP_DEVICE_ERROR_WIFI_NEED_CONNECT ||
+                event_data.error_kind == APP_DEVICE_ERROR_SCAN_QRCODE) {
+                /* Prompt only. SYS text would switch emote off the provisioning QR. */
+                device_play_error_audio(event_data.error_kind);
+                break;
+            }
+            if (event_data.error_kind == APP_DEVICE_ERROR_SERVER_CONNECTING ||
+                event_data.error_kind == APP_DEVICE_ERROR_SERVER_CONNECTED) {
+                /* Prompt only; agent-state text already shows Starting... / Zzzz... */
+                device_play_error_audio(event_data.error_kind);
+                break;
+            }
+            if (event_data.error_kind == APP_DEVICE_ERROR_LOW_POWER) {
+                g_device_data.error_active = true;
+                device_set_text(APP_DEVICE_TEXT_TYPE_SYSTEM, event_data.text);
+                break;
+            }
+            g_device_data.error_active = true;
+            device_set_text(APP_DEVICE_TEXT_TYPE_SYSTEM, event_data.text);
+            if (event_data.error_kind == APP_DEVICE_ERROR_CONVERSATION ||
+                event_data.error_kind == APP_DEVICE_ERROR_SERVICE ||
+                event_data.error_kind == APP_DEVICE_ERROR_QUOTA) {
+                /* Agent is being stopped; play after DEVICE_EVENT_SLEEP. */
+                g_device_data.pending_error_audio = event_data.error_kind;
+            } else {
+                device_play_error_audio(event_data.error_kind);
             }
             break;
 
@@ -439,12 +578,15 @@ esp_err_t app_device_init(app_device_config_t *config)
 
     // Initialize reminder state
     g_device_data.reminder_active = false;
+    g_device_data.error_active = false;
+    g_device_data.pending_error_audio = APP_DEVICE_ERROR_NONE;
 
     g_device_data.init_done = true;
     device_update_led(false);
 
     ESP_RETURN_ON_ERROR(app_touch_press_init(), TAG, "Failed to initialize touch press");
     ESP_RETURN_ON_ERROR(app_capacitive_touch_init(), TAG, "Failed to initialize touch sensor");
+    ESP_RETURN_ON_ERROR(app_battery_init(), TAG, "Failed to initialize battery monitor");
 
     return ESP_OK;
 }

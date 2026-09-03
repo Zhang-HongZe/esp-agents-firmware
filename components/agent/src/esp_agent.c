@@ -375,6 +375,16 @@ esp_err_t esp_agent_set_refresh_token(esp_agent_handle_t handle, const char *ref
     return ESP_OK;
 }
 
+esp_err_t esp_agent_clear_conversation_id(esp_agent_handle_t handle)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "handle is NULL");
+
+    esp_agent_t *agent = (esp_agent_t *)handle;
+    free(agent->conversation_id);
+    agent->conversation_id = NULL;
+    return ESP_OK;
+}
+
 esp_err_t esp_agent_new_conversation(esp_agent_handle_t handle)
 {
     ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "handle is NULL");

@@ -181,26 +181,34 @@ esp_err_t esp_agent_message_error_handler(esp_agent_handle_t handle, cJSON *cont
     esp_agent_message_data_t event_data;
     event_data.error.error = ESP_AGENT_ERROR_MAX;
 
-    /* check if content is json */
-    cJSON *json_content = cJSON_Parse(cJSON_GetStringValue(content));
-    if (json_content != NULL) {
+    /* content may be a JSON object or a string that itself contains JSON. */
+    cJSON *parsed_content = NULL;
+    cJSON *json_content = content;
+    if (cJSON_IsString(content)) {
+        parsed_content = cJSON_Parse(cJSON_GetStringValue(content));
+        if (parsed_content != NULL) {
+            json_content = parsed_content;
+        }
+    }
+
+    if (cJSON_IsObject(json_content)) {
         cJSON *error_code = cJSON_GetObjectItemCaseSensitive(json_content, "code");
         char *error_code_str = cJSON_GetStringValue(error_code);
         if (error_code_str != NULL) {
             if (strcmp(error_code_str, "AUDIO_CONVERSATION_ERROR") == 0) {
                 event_data.error.error = ESP_AGENT_AUDIO_CONVERSATION_ERROR;
+            } else if (strcmp(error_code_str, "QUOTA_EXCEEDED") == 0) {
+                event_data.error.error = ESP_AGENT_QUOTA_EXCEEDED_ERROR;
             }
         }
-        cJSON_Delete(json_content);
     }
+    cJSON_Delete(parsed_content);
 
     char *error_message = cJSON_PrintUnformatted(content);
     ESP_LOGE(TAG, "ESP Agent Error: %s", error_message);
     free(error_message);
 
-    if (event_data.error.error != ESP_AGENT_ERROR_MAX) {
-        esp_agent_post_event(handle, ESP_AGENT_EVENT_ERROR, &event_data);
-    }
+    esp_agent_post_event(handle, ESP_AGENT_EVENT_ERROR, &event_data);
 
     return ESP_OK;
 }

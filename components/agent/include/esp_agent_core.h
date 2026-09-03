@@ -115,6 +115,17 @@ esp_err_t esp_agent_stop(esp_agent_handle_t handle);
 esp_err_t esp_agent_new_conversation(esp_agent_handle_t handle);
 
 /**
+ * @brief Drop the stored conversation ID without stopping the agent.
+ *
+ * The next `esp_agent_start(handle, NULL)` will handshake without a
+ * conversation ID so the server assigns a new one.
+ *
+ * @param[in] handle Agent handle obtained from esp_agent_init
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if handle is NULL
+ */
+esp_err_t esp_agent_clear_conversation_id(esp_agent_handle_t handle);
+
+/**
  * @brief Sets the agent ID for the agent.
  *
  * @note If the agent is currently started, it will be stopped and restarted

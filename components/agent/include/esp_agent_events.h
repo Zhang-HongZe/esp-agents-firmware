@@ -48,6 +48,7 @@ typedef enum {
  */
 typedef enum {
     ESP_AGENT_AUDIO_CONVERSATION_ERROR,
+    ESP_AGENT_QUOTA_EXCEEDED_ERROR,
     ESP_AGENT_ERROR_MAX,
 } esp_agent_error_t;
 

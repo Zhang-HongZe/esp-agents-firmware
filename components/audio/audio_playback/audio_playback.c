@@ -7,6 +7,7 @@
 #include <freertos/FreeRTOS.h>
 
 #include <string.h>
+#include <stdlib.h>
 #include <esp_log.h>
 
 #include <esp_gmf_pool.h>
@@ -42,6 +43,9 @@ typedef struct audio_playback_s {
     size_t asp_embed_data_len;
     esp_asp_handle_t asp_handle;
     bool started;
+    bool prompt_expand_pcm;
+    uint8_t *prompt_pcm_buf;
+    size_t prompt_pcm_buf_len;
 } audio_playback_t;
 
 static esp_gmf_err_io_t playback_inport_acquire_read(void *handle, esp_gmf_data_bus_block_t *blk, int wanted_size, int block_ticks)
@@ -214,8 +218,38 @@ err:
 
 static int out_data_callback(uint8_t *data, int data_size, void *ctx)
 {
-    esp_codec_dev_handle_t dev = (esp_codec_dev_handle_t)ctx;
-    esp_codec_dev_write(dev, data, data_size);
+    audio_playback_t *playback = (audio_playback_t *)ctx;
+    if (!playback || !playback->out_dev_handle || !data || data_size <= 0) {
+        return 0;
+    }
+
+    /* ASP defaults to 16-bit mono after rate_cvt unless CH/BIT cvt are compiled in.
+     * DAC is 32-bit stereo; writing 16-bit mono makes every prompt play too fast.
+     */
+    if (playback->prompt_expand_pcm) {
+        size_t samples = (size_t)data_size / sizeof(int16_t);
+        size_t out_bytes = samples * 2U * sizeof(int32_t);
+        if (out_bytes > playback->prompt_pcm_buf_len) {
+            uint8_t *buf = realloc(playback->prompt_pcm_buf, out_bytes);
+            if (!buf) {
+                ESP_LOGE(TAG, "Prompt PCM expand alloc failed (%u)", (unsigned)out_bytes);
+                return 0;
+            }
+            playback->prompt_pcm_buf = buf;
+            playback->prompt_pcm_buf_len = out_bytes;
+        }
+        const int16_t *in = (const int16_t *)data;
+        int32_t *out = (int32_t *)playback->prompt_pcm_buf;
+        for (size_t i = 0; i < samples; i++) {
+            int32_t s = ((int32_t)in[i]) << 16;
+            out[2 * i] = s;
+            out[2 * i + 1] = s;
+        }
+        esp_codec_dev_write(playback->out_dev_handle, playback->prompt_pcm_buf, out_bytes);
+        return 0;
+    }
+
+    esp_codec_dev_write(playback->out_dev_handle, data, data_size);
     return 0;
 }
 
@@ -234,6 +268,26 @@ static int embed_flash_io_set(esp_asp_handle_t *handle, void *ctx)
             };
             ret = esp_gmf_io_embed_flash_set_context(flash, &embed_info, 1);
         }
+
+        /* Rate must match DAC. CH/BIT cvt exist only if ASP Kconfig enables them
+         * (Brookesia speaker sdkconfig). Otherwise expand 16-bit mono in the out cb.
+         */
+        esp_gmf_element_handle_t ele = NULL;
+        bool has_rate = (esp_gmf_pipeline_get_el_by_name(pipe, "aud_rate_cvt", &ele) == ESP_GMF_ERR_OK);
+        if (has_rate) {
+            esp_gmf_rate_cvt_set_dest_rate(ele, playback->out_codec_info.sample_rate);
+        }
+        bool has_ch = (esp_gmf_pipeline_get_el_by_name(pipe, "aud_ch_cvt", &ele) == ESP_GMF_ERR_OK);
+        if (has_ch) {
+            esp_gmf_ch_cvt_set_dest_channel(ele, playback->out_codec_info.channel);
+        }
+        bool has_bit = (esp_gmf_pipeline_get_el_by_name(pipe, "aud_bit_cvt", &ele) == ESP_GMF_ERR_OK);
+        if (has_bit) {
+            esp_gmf_bit_cvt_set_dest_bits(ele, playback->out_codec_info.bits_per_sample);
+        }
+        playback->prompt_expand_pcm = !(has_ch && has_bit);
+        ESP_LOGI(TAG, "Prompt dest %u Hz, pipeline ch_cvt=%d bit_cvt=%d expand_pcm=%d",
+                 playback->out_codec_info.sample_rate, has_ch, has_bit, playback->prompt_expand_pcm);
     }
     return ret;
 }
@@ -248,7 +302,7 @@ static esp_err_t media_playback_init(audio_playback_t *playback)
         },
         .out = {
             .cb = out_data_callback,
-            .user_ctx = playback->out_dev_handle,
+            .user_ctx = playback,
         },
         .prev = embed_flash_io_set,
         .prev_ctx = playback,
@@ -434,6 +488,10 @@ esp_err_t audio_playback_deinit(audio_playback_handle_t *handle)
         esp_audio_simple_player_destroy(playback->asp_handle);
         playback->asp_handle = NULL;
     }
+
+    free(playback->prompt_pcm_buf);
+    playback->prompt_pcm_buf = NULL;
+    playback->prompt_pcm_buf_len = 0;
 
     if (playback->task_handle) {
         esp_gmf_task_deinit(playback->task_handle);

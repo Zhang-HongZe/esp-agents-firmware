@@ -6,8 +6,12 @@
 
 #include <esp_log.h>
 #include <esp_check.h>
+#include <esp_timer.h>
+#include <esp_wifi.h>
+#include <esp_event.h>
 
 #include <esp_agent.h>
+#include <esp_agent_core.h>
 
 #include <agent_setup.h>
 #include <setup/rainmaker.h>
@@ -32,6 +36,175 @@ typedef struct {
 
 app_agent_data_t g_app_agent_data;
 
+#define APP_AGENT_ERR_MSG_NOT_CONFIGURED "Use RainMaker Home"
+#define APP_AGENT_MSG_WAITING_TOKEN      "Waiting for Home"
+#define APP_AGENT_ERR_MSG_WIFI           "WiFi disconnected"
+#define APP_AGENT_ERR_MSG_WIFI_NEED_CONNECT "Network not connected, please configure network"
+#define APP_AGENT_MSG_WIFI_CONNECTED     "WiFi connected"
+#define APP_AGENT_MSG_SERVER_CONNECTING  "Connecting..."
+#define APP_AGENT_MSG_SERVER_CONNECTED   "Service connected"
+#define APP_AGENT_ERR_MSG_QUOTA          "Quota exceeded"
+#define APP_AGENT_ERR_MSG_CONVERSATION   "Service disconnected"
+#define APP_AGENT_ERR_MSG_SERVICE        "Service disconnected"
+
+/* Home app sends AgentAuth.UserToken after MQTT; stock RainMaker app never does.
+ * This log wait covers that gap (Home typically ~10-15s after GOT_IP).
+ */
+#define APP_AGENT_TOKEN_WAIT_US          (40 * 1000 * 1000ULL)
+
+/* Match speaker AI_Buddy: wait 10s, then play need-connect up to 3 times / 20s. */
+#define APP_AGENT_WIFI_NEED_CONNECT_DELAY_US     (10 * 1000 * 1000ULL)
+#define APP_AGENT_WIFI_NEED_CONNECT_INTERVAL_US  (20 * 1000 * 1000ULL)
+#define APP_AGENT_WIFI_NEED_CONNECT_REPEAT       3
+
+#define APP_AGENT_SERVER_CONNECTING_INTERVAL_US  (20 * 1000 * 1000ULL)
+#define APP_AGENT_SERVER_CONNECTING_REPEAT       3
+
+static esp_timer_handle_t s_token_wait_timer;
+static esp_timer_handle_t s_wifi_need_connect_timer;
+static int s_wifi_need_connect_remaining;
+static esp_timer_handle_t s_server_connecting_timer;
+static int s_server_connecting_remaining;
+static bool s_wifi_had_ip;
+static bool s_agent_ever_started;
+static bool s_new_conversation_on_start;
+
+static void app_agent_report_error(const char *text, app_device_error_kind_t error_kind)
+{
+    if (!text) {
+        return;
+    }
+
+    /* Error strings are literals; do not strdup/free (heap was corrupted
+     * when free() ran while GMF media started during agent stop).
+     */
+    device_event_data_t event_data = {
+        .text = text,
+        .error_kind = error_kind,
+    };
+    app_device_event_enqueue(DEVICE_EVENT_ERROR, &event_data);
+}
+
+static void app_agent_token_wait_timeout(void *arg)
+{
+    (void)arg;
+    if (agent_setup_get_refresh_token()) {
+        return;
+    }
+    ESP_LOGW(TAG, "No UserToken after Wi-Fi/MQTT; likely ESP RainMaker app instead of RainMaker Home");
+    app_agent_report_error(APP_AGENT_ERR_MSG_NOT_CONFIGURED, APP_DEVICE_ERROR_NOT_CONFIGURED);
+}
+
+static void app_agent_stop_token_wait(void);
+static void app_agent_stop_wifi_need_connect(void);
+static void app_agent_schedule_wifi_need_connect(void);
+static void app_agent_stop_server_connecting(void);
+static void app_agent_start_server_connecting(void);
+
+static void app_agent_wifi_need_connect_timeout(void *arg)
+{
+    (void)arg;
+    if (s_wifi_had_ip) {
+        return;
+    }
+    ESP_LOGW(TAG, "Wi-Fi still down, play need-connect prompt (%d left)", s_wifi_need_connect_remaining);
+    app_agent_report_error(APP_AGENT_ERR_MSG_WIFI_NEED_CONNECT, APP_DEVICE_ERROR_WIFI_NEED_CONNECT);
+    s_wifi_need_connect_remaining--;
+    if (s_wifi_need_connect_remaining > 0 && s_wifi_need_connect_timer) {
+        esp_timer_start_once(s_wifi_need_connect_timer, APP_AGENT_WIFI_NEED_CONNECT_INTERVAL_US);
+    }
+}
+
+static void app_agent_stop_wifi_need_connect(void)
+{
+    s_wifi_need_connect_remaining = 0;
+    if (s_wifi_need_connect_timer && esp_timer_is_active(s_wifi_need_connect_timer)) {
+        esp_timer_stop(s_wifi_need_connect_timer);
+    }
+}
+
+static void app_agent_schedule_wifi_need_connect(void)
+{
+    if (s_wifi_had_ip || !s_wifi_need_connect_timer) {
+        return;
+    }
+    app_agent_stop_wifi_need_connect();
+    s_wifi_need_connect_remaining = APP_AGENT_WIFI_NEED_CONNECT_REPEAT;
+    ESP_LOGI(TAG, "No Wi-Fi yet, play need-connect prompt in %d ms",
+             (int)(APP_AGENT_WIFI_NEED_CONNECT_DELAY_US / 1000));
+    esp_timer_start_once(s_wifi_need_connect_timer, APP_AGENT_WIFI_NEED_CONNECT_DELAY_US);
+}
+
+static void app_agent_stop_server_connecting(void)
+{
+    s_server_connecting_remaining = 0;
+    if (s_server_connecting_timer && esp_timer_is_active(s_server_connecting_timer)) {
+        esp_timer_stop(s_server_connecting_timer);
+    }
+}
+
+static void app_agent_server_connecting_timeout(void *arg)
+{
+    (void)arg;
+    if (g_app_agent_data.state == APP_AGENT_STATE_STARTED ||
+        g_app_agent_data.state == APP_AGENT_STATE_DISCONNECTED) {
+        return;
+    }
+    app_agent_report_error(APP_AGENT_MSG_SERVER_CONNECTING, APP_DEVICE_ERROR_SERVER_CONNECTING);
+    s_server_connecting_remaining--;
+    if (s_server_connecting_remaining > 0 && s_server_connecting_timer) {
+        esp_timer_start_once(s_server_connecting_timer, APP_AGENT_SERVER_CONNECTING_INTERVAL_US);
+    }
+}
+
+static void app_agent_start_server_connecting(void)
+{
+    if (!s_server_connecting_timer) {
+        return;
+    }
+    app_agent_stop_server_connecting();
+    s_server_connecting_remaining = APP_AGENT_SERVER_CONNECTING_REPEAT - 1;
+    app_agent_report_error(APP_AGENT_MSG_SERVER_CONNECTING, APP_DEVICE_ERROR_SERVER_CONNECTING);
+    if (s_server_connecting_remaining > 0) {
+        esp_timer_start_once(s_server_connecting_timer, APP_AGENT_SERVER_CONNECTING_INTERVAL_US);
+    }
+}
+
+static void app_agent_wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg;
+    (void)event_data;
+    if (event_base != WIFI_EVENT || event_id != WIFI_EVENT_STA_DISCONNECTED) {
+        return;
+    }
+    /* Ignore probe/assoc failures before the first GOT_IP, and reconnect retries. */
+    if (!s_wifi_had_ip) {
+        return;
+    }
+    s_wifi_had_ip = false;
+    app_agent_stop_token_wait();
+    app_agent_stop_server_connecting();
+    ESP_LOGW(TAG, "Wi-Fi disconnected");
+    app_agent_report_error(APP_AGENT_ERR_MSG_WIFI, APP_DEVICE_ERROR_WIFI);
+    app_agent_schedule_wifi_need_connect();
+}
+
+static void app_agent_stop_token_wait(void)
+{
+    if (s_token_wait_timer && esp_timer_is_active(s_token_wait_timer)) {
+        esp_timer_stop(s_token_wait_timer);
+    }
+}
+
+static void app_agent_start_token_wait(void)
+{
+    if (!s_token_wait_timer) {
+        return;
+    }
+    app_agent_stop_token_wait();
+    esp_timer_start_once(s_token_wait_timer, APP_AGENT_TOKEN_WAIT_US);
+}
+
 static inline void app_agent_update_state(app_agent_state_t state)
 {
     g_app_agent_data.state = state;
@@ -49,6 +222,8 @@ void app_agent_default_event_handler(void *arg, esp_event_base_t event_base, int
             break;
         case ESP_AGENT_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "Agent Not Connected");
+            app_agent_stop_server_connecting();
+            s_new_conversation_on_start = true;
             app_agent_update_state(APP_AGENT_STATE_DISCONNECTED);
             // Stop microphone to prevent sending data while disconnected
             app_device_event_enqueue(DEVICE_EVENT_SLEEP, NULL);
@@ -92,15 +267,26 @@ void app_agent_default_event_handler(void *arg, esp_event_base_t event_base, int
             printf("\033[90mThought: %s\033[0m\n", data->thinking.thought);
             break;
         case ESP_AGENT_EVENT_ERROR:
+            app_agent_stop_server_connecting();
             if (data->error.error == ESP_AGENT_AUDIO_CONVERSATION_ERROR) {
                 ESP_LOGE(TAG, "ESP Agent Audio Conversation Error");
+                app_agent_report_error(APP_AGENT_ERR_MSG_CONVERSATION, APP_DEVICE_ERROR_CONVERSATION);
                 /* Device state will be changed to sleep on ESP_AGENT_EVENT_DISCONNECT */
                 esp_agent_stop(g_app_agent_data.agent_handle);
+            } else if (data->error.error == ESP_AGENT_QUOTA_EXCEEDED_ERROR) {
+                ESP_LOGE(TAG, "ESP Agent Quota Exceeded");
+                app_agent_report_error(APP_AGENT_ERR_MSG_QUOTA, APP_DEVICE_ERROR_QUOTA);
+                esp_agent_stop(g_app_agent_data.agent_handle);
+            } else {
+                ESP_LOGE(TAG, "ESP Agent Error: %d", data->error.error);
+                app_agent_report_error(APP_AGENT_ERR_MSG_SERVICE, APP_DEVICE_ERROR_SERVICE);
             }
-
             break;
         case ESP_AGENT_EVENT_START:
+            s_agent_ever_started = true;
+            app_agent_stop_server_connecting();
             app_agent_update_state(APP_AGENT_STATE_STARTED);
+            app_agent_report_error(APP_AGENT_MSG_SERVER_CONNECTED, APP_DEVICE_ERROR_SERVER_CONNECTED);
             ESP_LOGI(TAG, "ESP Agent Started");
             break;
         default:
@@ -122,6 +308,8 @@ void app_agent_start_task(void *arg)
     char *refresh_token = agent_setup_get_refresh_token();
     if (!agent_id || !refresh_token) {
         ESP_LOGE(TAG, "Agent ID or refresh token not found");
+        app_agent_report_error(APP_AGENT_ERR_MSG_NOT_CONFIGURED, APP_DEVICE_ERROR_NOT_CONFIGURED);
+        vTaskDelete(NULL);
         return;
     }
 
@@ -135,7 +323,9 @@ void app_agent_start_task(void *arg)
     app_device_event_enqueue(DEVICE_EVENT_SYSTEM_INITIALIZED, NULL);
 
 end:
-    (void)ret; /* Suppress unused variable warning */
+    if (ret != ESP_OK) {
+        app_agent_report_error(APP_AGENT_ERR_MSG_SERVICE, APP_DEVICE_ERROR_SERVICE);
+    }
     vTaskDelete(NULL);
 }
 
@@ -155,7 +345,40 @@ static void agent_setup_event_handler(void *arg, esp_event_base_t event_base, in
         case AGENT_SETUP_EVENT_START:
             {
                 ESP_LOGI(TAG, "Agent setup completed");
+                app_agent_stop_token_wait();
                 xTaskCreate(app_agent_start_task, "app_agent_start_task", 4096, NULL, 5, NULL);
+            }
+            break;
+
+        case AGENT_SETUP_EVENT_NETWORK_CONNECTED:
+            /* GOT_IP is not "missing token". Home app writes AgentAuth.UserToken
+             * only after MQTT; the stock RainMaker app never does.
+             */
+            s_wifi_had_ip = true;
+            app_agent_stop_wifi_need_connect();
+            ESP_LOGI(TAG, "Wi-Fi got IP");
+            app_agent_report_error(APP_AGENT_MSG_WIFI_CONNECTED, APP_DEVICE_ERROR_WIFI_CONNECTED);
+            if (!agent_setup_get_refresh_token()) {
+                ESP_LOGI(TAG, "Network connected, waiting for RainMaker Home UserToken");
+                app_agent_report_error(APP_AGENT_MSG_WAITING_TOKEN, APP_DEVICE_ERROR_WAITING_TOKEN);
+                app_agent_start_token_wait();
+            } else if (s_agent_ever_started &&
+                       g_app_agent_data.state != APP_AGENT_STATE_STARTED &&
+                       g_app_agent_data.state != APP_AGENT_STATE_CONNECTING) {
+                ESP_LOGI(TAG, "Wi-Fi restored, restarting agent");
+                app_agent_connect();
+            }
+            break;
+
+        case AGENT_SETUP_EVENT_REFRESH_TOKEN_UPDATE:
+            {
+                app_agent_stop_token_wait();
+                char *refresh_token = agent_setup_get_refresh_token();
+                if (g_app_agent_data.agent_handle && refresh_token) {
+                    ESP_LOGI(TAG, "Refresh token updated, applying without reboot");
+                    ESP_RETURN_VOID_ON_ERROR(esp_agent_set_refresh_token(g_app_agent_data.agent_handle, refresh_token),
+                                             TAG, "Failed to set refresh token");
+                }
             }
             break;
 
@@ -188,9 +411,18 @@ esp_err_t app_agent_connect(void)
     }
 
     app_agent_update_state(APP_AGENT_STATE_CONNECTING);
+    app_agent_start_server_connecting();
+    if (s_new_conversation_on_start) {
+        ESP_LOGI(TAG, "Previous session disconnected, starting a new conversation");
+        esp_agent_clear_conversation_id(g_app_agent_data.agent_handle);
+        s_new_conversation_on_start = false;
+    }
     esp_err_t ret = esp_agent_start(g_app_agent_data.agent_handle, NULL);
     if (ret != ESP_OK) {
+        app_agent_stop_server_connecting();
         app_agent_update_state(APP_AGENT_STATE_DISCONNECTED);
+        s_new_conversation_on_start = true;
+        app_agent_report_error(APP_AGENT_ERR_MSG_SERVICE, APP_DEVICE_ERROR_SERVICE);
     }
     return ret;
 }
@@ -210,6 +442,35 @@ esp_err_t app_agent_init(app_agent_config_t *config)
     ESP_RETURN_ON_ERROR(agent_setup_init(), TAG, "Failed to initialize agent setup");
 
     ESP_RETURN_ON_ERROR(esp_event_handler_register(AGENT_SETUP_EVENT, ESP_EVENT_ANY_ID, agent_setup_event_handler, NULL), TAG, "Failed to register agent event handler");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+                                                   app_agent_wifi_event_handler, NULL),
+                        TAG, "Failed to register Wi-Fi disconnect handler");
+
+    if (!s_token_wait_timer) {
+        const esp_timer_create_args_t timer_args = {
+            .callback = app_agent_token_wait_timeout,
+            .name = "token_wait",
+        };
+        ESP_RETURN_ON_ERROR(esp_timer_create(&timer_args, &s_token_wait_timer), TAG, "Failed to create token wait timer");
+    }
+
+    if (!s_wifi_need_connect_timer) {
+        const esp_timer_create_args_t wifi_need_args = {
+            .callback = app_agent_wifi_need_connect_timeout,
+            .name = "wifi_need",
+        };
+        ESP_RETURN_ON_ERROR(esp_timer_create(&wifi_need_args, &s_wifi_need_connect_timer), TAG,
+                            "Failed to create Wi-Fi need-connect timer");
+    }
+
+    if (!s_server_connecting_timer) {
+        const esp_timer_create_args_t server_connecting_args = {
+            .callback = app_agent_server_connecting_timeout,
+            .name = "srv_conn",
+        };
+        ESP_RETURN_ON_ERROR(esp_timer_create(&server_connecting_args, &s_server_connecting_timer), TAG,
+                            "Failed to create server-connecting timer");
+    }
 
     /* Initialize esp_agent without agent_id and refresh_token */
     esp_agent_audio_config_t upload_audio_config = {
@@ -260,6 +521,7 @@ esp_err_t app_agent_start(void)
     * RainMaker will start automatically when network connectivity is established.
     */
     ESP_RETURN_ON_ERROR(agent_setup_start(), TAG, "Failed to start network provisioning");
+    app_agent_schedule_wifi_need_connect();
     return ret;
 }
 

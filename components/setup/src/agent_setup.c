@@ -334,6 +334,9 @@ esp_err_t agent_setup_set_refresh_token(const char *refresh_token)
 
     ESP_LOGD(TAG, "Refresh Token saved to NVS");
 
+    /* Apply in the running process. Do not reboot after provisioning. */
+    esp_event_post(AGENT_SETUP_EVENT, AGENT_SETUP_EVENT_REFRESH_TOKEN_UPDATE, NULL, 0, portMAX_DELAY);
+
     return ESP_OK;
 err:
     if (g_agent_setup_data.refresh_token) {
