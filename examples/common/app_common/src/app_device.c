@@ -103,8 +103,13 @@ extern const uint8_t server_connecting_mp3_end[] asm("_binary_server_connecting_
 extern const uint8_t server_connected_mp3_start[] asm("_binary_server_connected_mp3_start");
 extern const uint8_t server_connected_mp3_end[] asm("_binary_server_connected_mp3_end");
 
-extern const uint8_t scan_qrcode_mp3_start[] asm("_binary_scan_qrcode_mp3_start");
-extern const uint8_t scan_qrcode_mp3_end[] asm("_binary_scan_qrcode_mp3_end");
+#ifdef APP_SCAN_QRCODE_RAINMAKER
+extern const uint8_t scan_qrcode_mp3_start[] asm("_binary_scan_qrcode_rainmaker_mp3_start");
+extern const uint8_t scan_qrcode_mp3_end[] asm("_binary_scan_qrcode_rainmaker_mp3_end");
+#else
+extern const uint8_t scan_qrcode_mp3_start[] asm("_binary_scan_qrcode_rainmaker_home_mp3_start");
+extern const uint8_t scan_qrcode_mp3_end[] asm("_binary_scan_qrcode_rainmaker_home_mp3_end");
+#endif
 
 static void device_play_error_audio(app_device_error_kind_t kind)
 {
@@ -151,9 +156,15 @@ static void device_play_error_audio(app_device_error_kind_t kind)
                                        server_disconnect_mp3_end - server_disconnect_mp3_start);
             break;
         case APP_DEVICE_ERROR_SCAN_QRCODE:
-            app_audio_play_media_async("embed://audio/0_scan_qrcode.mp3",
+#ifdef APP_SCAN_QRCODE_RAINMAKER
+            app_audio_play_media_async("embed://audio/0_scan_qrcode_rainmaker.mp3",
                                        scan_qrcode_mp3_start,
                                        scan_qrcode_mp3_end - scan_qrcode_mp3_start);
+#else
+            app_audio_play_media_async("embed://audio/0_scan_qrcode_rainmaker_home.mp3",
+                                       scan_qrcode_mp3_start,
+                                       scan_qrcode_mp3_end - scan_qrcode_mp3_start);
+#endif
             break;
         default:
             break;

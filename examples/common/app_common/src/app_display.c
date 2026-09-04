@@ -24,8 +24,11 @@
 #include "app_device.h"
 #include "app_network.h"
 #include "board_defs.h"
+#include "widget/gfx_qrcode.h"
 
 static const char *TAG = "app_display";
+
+#define APP_DISPLAY_QRCODE_SIZE  250
 
 typedef struct {
     bool initialized;
@@ -47,8 +50,10 @@ struct emote_s {
 
 static app_display_data_t s_display_data = {0};
 static esp_timer_handle_t s_scan_qrcode_timer;
+static int s_scan_qrcode_remaining;
 
-#define APP_DISPLAY_SCAN_QRCODE_INTERVAL_US  (10 * 1000 * 1000ULL)
+#define APP_DISPLAY_SCAN_QRCODE_INTERVAL_US  (20 * 1000 * 1000ULL)
+#define APP_DISPLAY_SCAN_QRCODE_REPEAT       3
 
 static void display_play_scan_qrcode(void)
 {
@@ -59,15 +64,26 @@ static void display_play_scan_qrcode(void)
     app_device_event_enqueue(DEVICE_EVENT_ERROR, &event_data);
 }
 
+static void display_stop_scan_qrcode_prompt(void)
+{
+    s_scan_qrcode_remaining = 0;
+    if (s_scan_qrcode_timer && esp_timer_is_active(s_scan_qrcode_timer)) {
+        esp_timer_stop(s_scan_qrcode_timer);
+    }
+}
+
 static void display_scan_qrcode_timer_cb(void *arg)
 {
     (void)arg;
     display_play_scan_qrcode();
+    s_scan_qrcode_remaining--;
+    if (s_scan_qrcode_remaining > 0 && s_scan_qrcode_timer) {
+        esp_timer_start_once(s_scan_qrcode_timer, APP_DISPLAY_SCAN_QRCODE_INTERVAL_US);
+    }
 }
 
 static void display_start_scan_qrcode_prompt(void)
 {
-    display_play_scan_qrcode();
     if (!s_scan_qrcode_timer) {
         const esp_timer_create_args_t args = {
             .callback = display_scan_qrcode_timer_cb,
@@ -78,15 +94,11 @@ static void display_start_scan_qrcode_prompt(void)
             return;
         }
     }
-    if (!esp_timer_is_active(s_scan_qrcode_timer)) {
-        esp_timer_start_periodic(s_scan_qrcode_timer, APP_DISPLAY_SCAN_QRCODE_INTERVAL_US);
-    }
-}
-
-static void display_stop_scan_qrcode_prompt(void)
-{
-    if (s_scan_qrcode_timer && esp_timer_is_active(s_scan_qrcode_timer)) {
-        esp_timer_stop(s_scan_qrcode_timer);
+    display_stop_scan_qrcode_prompt();
+    s_scan_qrcode_remaining = APP_DISPLAY_SCAN_QRCODE_REPEAT - 1;
+    display_play_scan_qrcode();
+    if (s_scan_qrcode_remaining > 0) {
+        esp_timer_start_once(s_scan_qrcode_timer, APP_DISPLAY_SCAN_QRCODE_INTERVAL_US);
     }
 }
 
@@ -286,6 +298,10 @@ static void display_event_handler(void *arg, esp_event_base_t event_base, int32_
 
         app_display_set_text(APP_DEVICE_TEXT_TYPE_SYSTEM, "Scan RainMaker Home", NULL);
         change_emotion_visibility(s_display_data.emote_handle, false);
+        gfx_obj_t *qrcode = emote_get_obj_by_name(s_display_data.emote_handle, "qrcode");
+        if (qrcode) {
+            gfx_qrcode_set_size(qrcode, APP_DISPLAY_QRCODE_SIZE);
+        }
         emote_set_qrcode_data(s_display_data.emote_handle, text);
         display_start_scan_qrcode_prompt();
 
